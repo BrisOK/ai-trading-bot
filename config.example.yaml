@@ -1,0 +1,24 @@
+exchange:
+    name: binance
+    apiKey: "YOUR_API_KEY_HERE"
+    secret: "YOUR_SECRET_KEY_HERE"
+    password: null                     # some exchanges use a password or uid
+    testnet: true                        # true = paper trading / testnet where supported
+
+trading:
+    symbol: "BTC/USDT"
+    timeframe: "1h"
+    max_position_usd: 100.0
+    risk_per_trade: 0.01         # 1% of max_position_usd
+    sl_pct: 0.01                         # 1% stop loss
+    tp_pct: 0.02                         # 2% take profit
+
+strategy:
+    type: "sma_crossover"
+    fast_window: 10
+    slow_window: 30
+
+runtime:
+    poll_interval_sec: 60        # how often to check for new candles
+    max_candles: 500                 # how many candles to keep in memory
+    dry_run: true                        # true = no real orders; just log
