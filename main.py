@@ -1,96 +1,94 @@
-import time
-import yaml
-import pandas as pd
-from pathlib import Path
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
 
-from exchange_client import ExchangeClient
-from strategy_sma import SMACrossoverStrategy
-from risk import compute_position_size, compute_sl_tp
-from utils import setup_logger
+from database import Base, engine, get_db
+import models, schemas, crud
+from ai_model import get_signal_for_symbol
+import yfinance as yf
+import requests
 
-logger = setup_logger("ai_trading_bot")
+Base.metadata.create_all(bind=engine)
 
-def load_config(path: str = "config.yaml") -> dict:
-        with open(path, "r") as f:
-                return yaml.safe_load(f)
+app = FastAPI(title="AI Trading API", version="0.2.0")
 
-def ohlcv_to_df(ohlcv) -> pd.DataFrame:
-        cols = ["timestamp", "open", "high", "low", "close", "volume"]
-        df = pd.DataFrame(ohlcv, columns=cols)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        return df
+# CORS stays the same
+origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+]
 
-def main():
-        if not Path("config.yaml").exists():
-                raise FileNotFoundError(
-                        "config.yaml not found. Copy config.example.yaml to config.yaml and set your API keys."
-                )
+app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+)
 
-        config = load_config()
-        exch_cfg = config["trading"]
-        symbol = exch_cfg["symbol"]
-        timeframe = exch_cfg["timeframe"]
-        max_candles = config["runtime"]["max_candles"]
-        interval = config["runtime"]["poll_interval_sec"]
-        dry_run = config["runtime"]["dry_run"]
 
-        exchange = ExchangeClient(config)
+@app.get("/health")
+def health_check():
+        return {"status": "ok"}
 
-        strat_cfg = config["strategy"]
-        strategy = SMACrossoverStrategy(
-                fast_window=strat_cfg["fast_window"],
-                slow_window=strat_cfg["slow_window"],
-        )
 
-        logger.info(f"Starting bot on {symbol} ({timeframe}) dry_run={dry_run}")
+@app.get("/trades", response_model=list[schemas.Trade])
+def list_trades(db: Session = Depends(get_db)):
+        return crud.get_trades(db)
 
-        # Initial data
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=max_candles)
-        df = ohlcv_to_df(ohlcv)
 
-        while True:
-                try:
-                        # Fetch latest candles
-                        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=max_candles)
-                        df = ohlcv_to_df(ohlcv)
+@app.post("/trades", response_model=schemas.Trade)
+def create_trade(trade: schemas.TradeCreate, db: Session = Depends(get_db)):
+        if trade.side not in ["buy", "sell"]:
+                raise HTTPException(status_code=400, detail="side must be 'buy' or 'sell'")
+        return crud.create_trade(db, trade)
 
-                        # Generate signal
-                        signal = strategy.generate_signal(df)
-                        last_close = df["close"].iloc[-1]
 
-                        if signal == 1:
-                                side = "buy"
-                                logger.info(f"Long signal at price {last_close}")
-                        elif signal == -1:
-                                side = "sell"
-                                logger.info(f"Short signal at price {last_close}")
-                        else:
-                                logger.info("No new signal.")
-                                time.sleep(interval)
-                                continue
+@app.get("/signals", response_model=list[schemas.Signal])
+def list_signals(symbol: str | None = None, db: Session = Depends(get_db)):
+        return crud.get_signals(db, symbol)
 
-                        # Compute size & SL/TP
-                        amount = compute_position_size(last_close, config)
-                        sl_price, tp_price = compute_sl_tp(last_close, side, config)
-                        logger.info(f"Amount: {amount:.6f} | SL: {sl_price:.2f} | TP: {tp_price:.2f}")
 
-                        if dry_run:
-                                logger.info("[DRY RUN] Would place market order + SL/TP here.")
-                        else:
-                                # Live order placement
-                                order = exchange.create_market_order(symbol, side, amount)
-                                logger.info(f"Market order placed: {order}")
-                                stp = exchange.create_stop_loss_take_profit(symbol, side, amount, sl_price, tp_price)
-                                logger.info(f"SL/TP (pseudo): {stp}")
+@app.post("/signals", response_model=schemas.Signal)
+def generate_signal(payload: schemas.SignalRequest, db: Session = Depends(get_db)):
+        market = payload.market.lower()
+        if market not in ("stock", "crypto"):
+                raise HTTPException(status_code=400, detail="market must be 'stock' or 'crypto'")
 
-                        time.sleep(interval)
+        prediction, recommendation = get_signal_for_symbol(payload.symbol, market=market)
+        signal = crud.create_signal(db, payload.symbol.upper(), prediction, recommendation)
+        return signal
 
-                except KeyboardInterrupt:
-                        logger.info("Bot stopped by user.")
-                        break
-                except Exception as e:
-                        logger.exception(f"Error in main loop: {e}")
-                        time.sleep(5)
 
-if __name__ == "__main__":
-        main()
+@app.get("/price")
+def get_price(symbol: str, market: str = "stock"):
+        """
+        Get latest price for a symbol, for display in the UI.
+
+        - stock: uses Yahoo Finance
+        - crypto: uses Binance public API
+        """
+        try:
+                symbol_up = symbol.upper()
+                if market == "crypto":
+                        # Binance ticker price endpoint
+                        url = "https://api.binance.com/api/v3/ticker/price"
+                        resp = requests.get(url, params={"symbol": symbol_up}, timeout=10)
+                        resp.raise_for_status()
+                        data = resp.json()
+                        price = float(data["price"])
+                else:
+                        # Stock price via yfinance
+                        ticker = yf.Ticker(symbol_up)
+                        hist = ticker.history(period="1d")
+                        if hist.empty:
+                                raise ValueError(f"No price data for stock symbol {symbol_up}")
+                        price = float(hist["Close"].iloc[-1])
+
+                return {
+                        "symbol": symbol_up,
+                        "market": market,
+                        "price": price,
+                }
+        except Exception as e:
+                raise HTTPException(status_code=400, detail=str(e))
